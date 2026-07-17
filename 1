@@ -1,0 +1,301 @@
+import os
+import logging
+import json
+import csv
+import random
+import time
+from web3 import Web3
+from eth_account import Account
+from cryptography.fernet import Fernet
+from eth_utils import to_checksum_address
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("base_names_renewal.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+logging.info("=" * 70)
+logging.info("[WARNING] СКРИПТ ЗАПУЩЕН - ПАУЗЫ 1-2 МИНУТЫ МЕЖДУ КОШЕЛЬКАМИ")
+logging.info("У ВАС ЕСТЬ ВРЕМЯ ОСТАНОВИТЬ (Ctrl+C) ЕСЛИ ЧТО-ТО НЕ ТАК")
+logging.info("=" * 70)
+time.sleep(3)
+
+# RPC провайдеры для Base
+rpc_providers = [
+    'https://lb.drpc.org/base/Al4GEsJFpUVZiy4U_y2tnQL4X5R1p-UR76hgFhW5UfFk',
+    'https://base.llamarpc.com',
+    'https://0xrpc.io/base',
+]
+
+current_rpc_index = 0
+w3 = None
+
+
+def connect_to_rpc():
+    global w3, current_rpc_index
+    for i, rpc in enumerate(rpc_providers):
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 10}))
+            if w3.isConnected():
+                logging.info(f"[OK] Успешно подключено к RPC: {rpc}")
+                current_rpc_index = i
+                return True
+        except Exception as e:
+            logging.error(f"[ERROR] Ошибка при подключении к {rpc}: {e}")
+    return False
+
+
+def switch_rpc():
+    global w3, current_rpc_index
+    current_rpc_index = (current_rpc_index + 1) % len(rpc_providers)
+    new_rpc = rpc_providers[current_rpc_index]
+    try:
+        w3 = Web3(Web3.HTTPProvider(new_rpc, request_kwargs={'timeout': 10}))
+        if w3.isConnected():
+            logging.info(f"[OK] Переключились на RPC: {new_rpc}")
+            return True
+    except Exception as e:
+        logging.error(f"[ERROR] Ошибка при переключении: {e}")
+    return False
+
+
+# Подключаемся к Base
+logging.info("Подключаемся к Base сети...")
+if not connect_to_rpc():
+    logging.error("[ERROR] Не удалось подключиться ни к одному RPC")
+    exit(1)
+
+# Получаем ключ шифрования
+key = os.getenv('126')
+if key is None:
+    logging.error("[ERROR] Ключ шифрования '126' не найден в переменных среды")
+    exit(1)
+
+key = key.strip("b'").encode()
+cipher_suite = Fernet(key)
+
+# Загружаем приватные ключи
+logging.info("Загружаем приватные ключи...")
+try:
+    with open('encrypted_126.json', 'rb') as f:
+        encrypted_data = f.read()
+    decrypted_data = cipher_suite.decrypt(encrypted_data)
+    data = json.loads(decrypted_data)
+    private_keys_raw = data['keys']
+except Exception as e:
+    logging.error(f"[ERROR] Ошибка при загрузке ключей: {e}")
+    exit(1)
+
+# Обрабатываем ключи
+private_keys = []
+wallets = []
+for key_str in private_keys_raw[:126]:
+    key_cleaned = key_str[2:] if key_str.startswith('0x') else key_str
+    if len(key_cleaned) != 64:
+        continue
+    try:
+        account = Account.privateKeyToAccount(key_cleaned)
+        private_keys.append(key_cleaned)
+        wallets.append(account.address)
+    except Exception:
+        continue
+
+logging.info(f"[OK] Загружено {len(wallets)} кошельков")
+
+# Загружаем исключения
+excluded_wallets = set()
+if os.path.exists('excluded_wallets.txt'):
+    try:
+        with open('excluded_wallets.txt', 'r') as f:
+            for line in f:
+                addr = line.strip().lower()
+                if addr and addr.startswith('0x'):
+                    excluded_wallets.add(addr)
+        logging.info(f"[OK] Загружено {len(excluded_wallets)} исключённых адресов")
+    except Exception as e:
+        logging.warning(f"[WARNING] Ошибка при загрузке исключений: {e}")
+
+# Загружаем имена из CSV
+basenames_map = {}
+if os.path.exists('basenames_list.csv'):
+    try:
+        with open('basenames_list.csv', 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                addr = row.get('address', '').strip().lower()
+                name = row.get('name', '').strip().lower()
+                if addr and name:
+                    if name.endswith('.base.eth'):
+                        name = name.replace('.base.eth', '')
+                    basenames_map[addr] = name
+        logging.info(f"[OK] Загружено {len(basenames_map)} имён из CSV")
+    except Exception as e:
+        logging.error(f"[ERROR] Ошибка при чтении CSV: {e}")
+        exit(1)
+else:
+    logging.error("[ERROR] Файл basenames_list.csv не найден")
+    exit(1)
+
+# Контракт
+CONTROLLER_ADDRESS = to_checksum_address("0xa7d2607c6BD39Ae9521e514026CBB078405Ab322")
+CONTROLLER_ABI = [
+    {
+        "inputs": [
+            {"internalType": "string", "name": "name", "type": "string"},
+            {"internalType": "uint256", "name": "duration", "type": "uint256"}
+        ],
+        "name": "renew",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+    }
+]
+
+
+def renew_domain(wallet_addr, private_key, domain_name):
+    """Продлить домен"""
+    try:
+        # Выбираем срок: 6 или 7 лет
+        duration_seconds = random.choice([190915392, 222619424])
+        years = 6 if duration_seconds == 190915392 else 7
+
+        # Цена из успешных транзакций + запас
+        # 6 лет: 0.000499886111556 ETH
+        # 7 лет: 0.0006998405561784 ETH
+        if duration_seconds == 190915392:  # 6 лет
+            price_wei = int(0.0005 * 10 ** 18)  # 0.0005 ETH
+        else:  # 7 лет
+            price_wei = int(0.0007 * 10 ** 18)  # 0.0007 ETH
+
+        wallet_addr = to_checksum_address(wallet_addr)
+
+        logging.info(f"[PRICE] Продлеваем {domain_name}.base.eth на {years} лет, цена: {price_wei / 10 ** 18:.8f} ETH")
+
+        # Баланс
+        balance_wei = w3.eth.getBalance(wallet_addr)
+        balance_eth = balance_wei / 10 ** 18
+        logging.info(f"[BALANCE] Баланс: {balance_eth:.8f} ETH")
+
+        if balance_wei < price_wei:
+            logging.error(f"[ERROR] Недостаточно средств")
+            return False
+
+        # Nonce
+        nonce = w3.eth.getTransactionCount(wallet_addr)
+
+        # Создаём контракт
+        contract = w3.eth.contract(address=CONTROLLER_ADDRESS, abi=CONTROLLER_ABI)
+
+        # Строим функцию renew
+        renew_func = contract.functions.renew(domain_name, duration_seconds)
+
+        # Строим транзакцию с EIP-1559
+        tx = renew_func.buildTransaction({
+            'from': wallet_addr,
+            'value': price_wei,
+            'gas': 100000,
+            'maxFeePerGas': int(0.03 * 10 ** 9),  # 0.03 Gwei
+            'maxPriorityFeePerGas': int(0.01 * 10 ** 9),  # 0.01 Gwei
+            'nonce': nonce,
+            'chainId': 8453,
+            'type': 2  # EIP-1559
+        })
+
+        # Подписываем
+        signed_tx = w3.eth.account.sign_transaction(tx, private_key)
+
+        # Отправляем
+        tx_hash = w3.eth.sendRawTransaction(signed_tx.rawTransaction)
+        tx_hash_hex = tx_hash.hex()
+
+        logging.info(f"[SEND] Отправлена транзакция: {tx_hash_hex}")
+
+        # Ждём подтверждения
+        for attempt in range(6):
+            time.sleep(10)
+            try:
+                receipt = w3.eth.getTransactionReceipt(tx_hash)
+                if receipt:
+                    if receipt['status'] == 1:
+                        logging.info(f"[SUCCESS] Успешно! {domain_name}.base.eth продлён на {years} лет")
+                        return True
+                    else:
+                        logging.error(f"[ERROR] Транзакция провалилась (status=0)")
+                        return False
+            except Exception as e:
+                logging.warning(f"[WARNING] Ошибка проверки статуса: {e}")
+                if attempt == 5:
+                    logging.warning(f"[WARNING] Транзакция не подтвердилась, но отправлена")
+                    return True
+
+        return True
+
+    except Exception as e:
+        logging.error(f"[ERROR] Ошибка при продлении {domain_name}: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+        return False
+
+
+# Основной цикл
+if __name__ == "__main__":
+    logging.info("=" * 70)
+    logging.info(f"[START] Начинаем продление {len(wallets)} кошельков")
+    logging.info("=" * 70)
+
+    renewed_count = 0
+    failed_count = 0
+    skipped_count = 0
+
+    for i, wallet in enumerate(wallets):
+        try:
+            logging.info(f"\n{'=' * 70}")
+            logging.info(f"[INFO] [{i + 1}/{len(wallets)}] {wallet}")
+            logging.info('=' * 70)
+
+            # Проверяем исключения
+            if wallet.lower() in excluded_wallets:
+                logging.info(f"[SKIP] В списке исключений, пропускаем")
+                skipped_count += 1
+                continue
+
+            # Ищем имя
+            domain_name = basenames_map.get(wallet.lower())
+            if not domain_name:
+                logging.warning(f"[SKIP] Имя не найдено в CSV")
+                skipped_count += 1
+                continue
+
+            logging.info(f"[NAME] Имя: {domain_name}.base.eth")
+
+            # Продлеваем
+            success = renew_domain(wallet, private_keys[i], domain_name)
+
+            if success:
+                renewed_count += 1
+            else:
+                failed_count += 1
+
+            # Пауза
+            pause_time = random.uniform(60, 120)
+            logging.info(f"[PAUSE] Ожидаем {pause_time:.0f} сек...")
+            time.sleep(pause_time)
+
+        except KeyboardInterrupt:
+            logging.info("\n[STOP] ОСТАНОВЛЕНО ПОЛЬЗОВАТЕЛЕМ")
+            break
+        except Exception as e:
+            logging.error(f"[ERROR] {e}")
+            failed_count += 1
+
+    logging.info(f"\n{'=' * 70}")
+    logging.info(f"[STATS] ИТОГО:")
+    logging.info(f"[SUCCESS] Продлено: {renewed_count}")
+    logging.info(f"[ERROR] Ошибок: {failed_count}")
+    logging.info(f"[SKIP] Пропущено: {skipped_count}")
+    logging.info('=' * 70)
