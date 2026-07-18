@@ -1,0 +1,400 @@
+import os
+import logging
+from web3 import Web3
+from eth_account import Account
+import random
+import time
+from cryptography.fernet import Fernet
+import json
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("linea_transactions.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# Устанавливаем RPC провайдеры для Linea
+rpc_providers = [
+    'https://1rpc.io/linea',
+    'https://rpc.linea.build',
+    'https://linea-rpc.publicnode.com'
+]
+
+# Инициализация Web3 с возможностью переключения RPC
+current_rpc_index = 0
+
+def switch_rpc():
+    global w3, current_rpc_index
+    current_rpc_index = (current_rpc_index + 1) % len(rpc_providers)
+    new_rpc = rpc_providers[current_rpc_index]
+    logging.info(f"Переключаемся на RPC: {new_rpc}")
+    w3 = Web3(Web3.HTTPProvider(new_rpc))
+    if not w3.isConnected():
+        logging.error(f"Не удалось подключиться к {new_rpc}")
+        return False
+    logging.info(f"Успешно подключено к {new_rpc}")
+    return True
+
+# Подключаемся к сети Linea
+w3 = None
+for rpc in rpc_providers:
+    try:
+        w3 = Web3(Web3.HTTPProvider(rpc))
+        if w3.isConnected():
+            logging.info(f"Успешно подключено к {rpc}")
+            break
+    except Exception as e:
+        logging.error(f"Ошибка при подключении к {rpc}: {e}")
+        continue
+
+if w3 is None or not w3.isConnected():
+    logging.error("Не удалось подключиться к провайдеру RPC")
+    exit(1)
+
+# Получаем ключ шифрования из переменных среды
+key = os.getenv('linea_22_kow.json')
+if key is None:
+    logging.error("Не найден ключ шифрования")
+    exit(1)
+
+key = key.strip("b'").encode()
+cipher_suite = Fernet(key)
+
+# Читаем и расшифровываем файл с приватными ключами
+try:
+    with open('linea_22_kow.json', 'rb') as file:
+        encrypted_data = file.read()
+    decrypted_data = cipher_suite.decrypt(encrypted_data)
+    data = json.loads(decrypted_data)
+    private_keys_raw = data['keys']
+except Exception as e:
+    logging.error(f"Ошибка при чтении файла: {e}")
+    exit(1)
+
+# Обрабатываем приватные ключи
+private_keys = []
+wallets = []
+for key in private_keys_raw[:22]:
+    key_cleaned = key[2:] if key.startswith('0x') else key
+    if len(key_cleaned) != 64:
+        logging.warning(f"Недопустимая длина ключа (последние 4 символа: {key_cleaned[-4:]}). Пропускаем...")
+        continue
+    try:
+        account = Account.privateKeyToAccount(key_cleaned)
+        private_keys.append(key_cleaned)
+        wallets.append(account.address)
+        logging.info(f"Ключ с окончанием {key_cleaned[-4:]} валиден.")
+    except Exception as e:
+        logging.warning(f"Недопустимый ключ (последние 4 символа: {key_cleaned[-4:]}). Пропускаем... {e}")
+        continue
+
+if len(wallets) != 22:
+    logging.error(f"Ожидалось 22 кошелька, найдено {len(wallets)}")
+    exit(1)
+
+# Функция для получения актуального баланса (одна попытка)
+def get_balance_with_retries(wallet):
+    try:
+        balance = w3.eth.getBalance(wallet)
+        return balance
+    except Exception as e:
+        logging.warning(f"Ошибка получения баланса {wallet}: {e}")
+        switch_rpc()  # Переключаем RPC при ошибке
+        return None
+
+# Функция для проверки статуса транзакции (одна попытка)
+def check_transaction_status(txn_hash):
+    try:
+        receipt = w3.eth.getTransactionReceipt(txn_hash)
+        if receipt is None:
+            logging.info(f"Транзакция {txn_hash} ещё не подтверждена, ждём...")
+            return None
+        return receipt
+    except Exception as e:
+        logging.warning(f"Ошибка проверки статуса транзакции {txn_hash}: {e}")
+        switch_rpc()  # Переключаем RPC при ошибке
+        return None
+
+# Функция для поиска хэша транзакции по nonce
+def get_pending_txn_hash(wallet, nonce):
+    try:
+        # Получаем последнюю транзакцию с указанным nonce
+        pending_txns = w3.eth.getTransactionCount(wallet, 'pending')
+        if pending_txns > nonce:
+            # Если nonce уже подтверждён, транзакция не в pending
+            return None
+        # Пробуем получить транзакцию по nonce (зависит от провайдера)
+        for i in range(nonce, pending_txns):
+            txn = w3.eth.getTransactionByBlock(wallet, i)
+            if txn and txn['nonce'] == nonce:
+                return txn['hash'].hex()
+        return None
+    except Exception as e:
+        logging.warning(f"Ошибка при поиске транзакции с nonce {nonce}: {e}")
+        return None
+
+# Функция отправки транзакции
+def send_transaction(sender_wallet, receiver_wallet, private_key, amount_to_send_wei, gas_price_gwei, nonce):
+    gas_limit = 21000
+    gas_price_wei = w3.toWei(gas_price_gwei, 'gwei')
+    gas_cost = gas_limit * gas_price_wei
+
+    txn = {
+        'to': receiver_wallet,
+        'value': amount_to_send_wei,
+        'gas': gas_limit,
+        'gasPrice': gas_price_wei,
+        'nonce': nonce,
+        'chainId': 59144
+    }
+
+    try:
+        signed_txn = w3.eth.account.signTransaction(txn, private_key)
+        txn_hash = w3.eth.sendRawTransaction(signed_txn.rawTransaction)
+        txn_hash_hex = txn_hash.hex()
+        logging.info(
+            f"Отправлена транзакция {txn_hash_hex} от {sender_wallet} к {receiver_wallet} на {w3.fromWei(amount_to_send_wei, 'ether')} ETH, "
+            f"Gas Price: {gas_price_gwei} Gwei"
+        )
+        return txn_hash_hex
+    except Exception as e:
+        if "Known transaction" in str(e) or "Replacement transaction underpriced" in str(e):
+            logging.warning(f"Транзакция с nonce {nonce} уже в mempool, нужно дождаться подтверждения...")
+            return None  # Возвращаем None, чтобы основной цикл обработал ситуацию
+        logging.error(f"Ошибка при отправке транзакции: {e}")
+        switch_rpc()  # Переключаем RPC при ошибке
+        return None
+
+# Логика пересылки ETH по кругу
+while True:
+    last_tx_hashes = {wallet: None for wallet in wallets}
+
+    for i in range(len(wallets)):
+        sender_wallet = wallets[i]
+        receiver_wallet = wallets[(i + 1) % len(wallets)]
+        private_key = private_keys[i]
+
+        logging.info(f"\nОбработка кошелька {i + 1}/{len(wallets)}: {sender_wallet} -> {receiver_wallet}")
+
+        try:
+            # Получаем баланс отправителя
+            balance_wei = get_balance_with_retries(sender_wallet)
+            if balance_wei is None:
+                logging.error(f"Не удалось получить баланс отправителя {sender_wallet}, пропускаем...")
+                continue
+            balance_eth = w3.fromWei(balance_wei, 'ether')
+            logging.info(f"Баланс кошелька {sender_wallet}: {balance_eth} ETH")
+
+            if balance_wei <= w3.toWei(0.04, 'ether'):
+                logging.info(f"Баланс кошелька {sender_wallet} слишком мал ({balance_eth} ETH), пропускаем.")
+                continue
+
+            # Получаем начальный баланс получателя
+            initial_receiver_balance = get_balance_with_retries(receiver_wallet)
+            if initial_receiver_balance is None:
+                logging.error(f"Не удалось получить начальный баланс получателя {receiver_wallet}, пропускаем...")
+                continue
+            logging.info(f"Начальный баланс получателя {receiver_wallet}: {w3.fromWei(initial_receiver_balance, 'ether')} ETH")
+
+            # Получаем nonce последней подтверждённой транзакции
+            nonce = w3.eth.getTransactionCount(sender_wallet, 'latest')
+            logging.info(f"Последний подтверждённый nonce для {sender_wallet}: {nonce}")
+
+            # Вычисляем 97% от баланса для отправки
+            percentage_to_send = 0.97
+            amount_to_send_wei = int(balance_wei * percentage_to_send)
+
+            # Начальная цена газа (случайная в диапазоне от 0.05 до 0.1 Gwei)
+            gas_price_gwei = random.uniform(0.08, 0.1)
+            logging.info(f"Случайная начальная цена газа: {gas_price_gwei} Gwei")
+            gas_limit = 21000
+            gas_cost = gas_limit * w3.toWei(gas_price_gwei, 'gwei')
+
+            if amount_to_send_wei + gas_cost > balance_wei:
+                amount_to_send_wei = balance_wei - gas_cost
+                logging.info(f"Скорректирована сумма до {w3.fromWei(amount_to_send_wei, 'ether')} ETH")
+
+            if amount_to_send_wei <= 0:
+                logging.info(f"Недостаточно средств для отправки с {sender_wallet}.")
+                continue
+
+            # Если у нас уже есть хэш pending-транзакции для этого кошелька, используем его
+            txn_hash = last_tx_hashes.get(sender_wallet)
+            if not txn_hash:
+                # Пробуем найти хэш транзакции с текущим nonce
+                pending_txn_hash = get_pending_txn_hash(sender_wallet, nonce)
+                if pending_txn_hash:
+                    txn_hash = pending_txn_hash
+                    last_tx_hashes[sender_wallet] = txn_hash
+                    logging.info(f"Найден хэш pending-транзакции для {sender_wallet}: {txn_hash}")
+
+            if txn_hash:
+                logging.info(f"Уже есть pending-транзакция для {sender_wallet} с хэшем {txn_hash}, проверяем её статус...")
+
+            # Цикл отправки транзакции до успешного подтверждения
+            while True:
+                # Если хэша нет, пытаемся отправить новую транзакцию
+                if not txn_hash:
+                    txn_hash = send_transaction(sender_wallet, receiver_wallet, private_key, amount_to_send_wei, gas_price_gwei, nonce)
+                    if not txn_hash:
+                        # Если транзакция уже в mempool, но хэш неизвестен, пробуем найти хэш
+                        pending_txn_hash = get_pending_txn_hash(sender_wallet, nonce)
+                        if pending_txn_hash:
+                            txn_hash = pending_txn_hash
+                            logging.info(f"Найден хэш pending-транзакции для {sender_wallet}: {txn_hash}")
+                        else:
+                            logging.info(f"Транзакция с nonce {nonce} уже в mempool, но хэш неизвестен. Пропускаем отправку, ждём подтверждения...")
+                    if txn_hash:
+                        # Сохраняем хэш транзакции
+                        last_tx_hashes[sender_wallet] = txn_hash
+
+                # Цикл проверки статуса: проверяем каждые 10 секунд в течение 1 минуты (6 проверок)
+                max_attempts = 6  # 1 минута / 10 секунд = 6 попыток
+                for attempt in range(max_attempts):
+                    time.sleep(30)  # Ждём 10 секунд перед проверкой
+                    if txn_hash:
+                        receipt = check_transaction_status(txn_hash)
+                        if receipt is not None:
+                            break  # Если транзакция подтвердилась, выходим из цикла
+                    else:
+                        # Если хэш неизвестен, проверяем nonce
+                        current_nonce = w3.eth.getTransactionCount(sender_wallet, 'latest')
+                        if current_nonce > nonce:
+                            logging.info(f"Транзакция с nonce {nonce} подтвердилась (текущий nonce: {current_nonce})")
+                            receipt = True  # Флаг, что транзакция подтвердилась
+                            break
+                    logging.info(f"Проверка статуса транзакции с nonce {nonce}, попытка {attempt + 1}/{max_attempts}, RPC сменён, ждём 10 секунд...")
+                    switch_rpc()  # Переключаем RPC при каждой проверке
+
+                # Если транзакция подтвердилась, обрабатываем её
+                if receipt is not None:
+                    if txn_hash and receipt is not True:  # Если у нас есть хэш и это не флаг
+                        if receipt['status'] == 0:
+                            logging.warning(f"Транзакция {txn_hash} провалилась (status=0), увеличиваем газ...")
+                            gas_price_gwei = random.uniform(0.3, 0.4)  # Новая цена газа: 0.3–0.4 Gwei
+                            logging.info(f"Новая цена газа: {gas_price_gwei} Gwei")
+                            nonce = w3.eth.getTransactionCount(sender_wallet, 'latest')  # Обновляем nonce
+                            txn_hash = None  # Сбрасываем хэш для новой попытки
+                            last_tx_hashes[sender_wallet] = None
+                            continue  # Пробуем снова с новым газом
+                        elif receipt['status'] == 1:
+                            logging.info(f"Транзакция {txn_hash} подтверждена (status=1)")
+                            expected_amount = amount_to_send_wei
+                            logging.info(f"Ожидаем поступление {w3.fromWei(expected_amount, 'ether')} ETH на {receiver_wallet}")
+                        else:
+                            logging.error(f"Неизвестный статус транзакции {txn_hash}: {receipt['status']}")
+                            switch_rpc()
+                            time.sleep(30)
+                            continue
+                    else:
+                        # Транзакция подтвердилась (по nonce), но хэш неизвестен
+                        logging.info(f"Транзакция с nonce {nonce} подтверждена (по nonce), ожидаем поступления ETH...")
+
+                    # Проверяем баланс получателя с паузой 10 секунд
+                    while True:
+                        time.sleep(30)  # Ждём 10 секунд перед проверкой
+                        current_receiver_balance = get_balance_with_retries(receiver_wallet)
+                        if current_receiver_balance is None:
+                            logging.info(f"Не удалось получить баланс {receiver_wallet}, RPC сменён, ждём 10 секунд...")
+                            continue
+                        if current_receiver_balance > initial_receiver_balance:
+                            received_amount = current_receiver_balance - initial_receiver_balance
+                            logging.info(
+                                f"ETH поступил на {receiver_wallet}: получено {w3.fromWei(received_amount, 'ether')} ETH, "
+                                f"новый баланс: {w3.fromWei(current_receiver_balance, 'ether')} ETH"
+                            )
+                            break  # ETH поступил, выходим из цикла ожидания
+                        logging.info(f"ETH пока не поступил на {receiver_wallet}, меняем RPC и ждём 10 секунд...")
+                        switch_rpc()  # Меняем RPC, если баланс не увеличился
+                    last_tx_hashes[sender_wallet] = None  # Очищаем хэш после успешной транзакции
+                    break  # Транзакция успешна, выходим из цикла отправки
+
+                # Если транзакция не подтвердилась за 1 минуту, проталкиваем с новой ценой газа
+                logging.warning(f"Транзакция с nonce {nonce} не подтвердилась за 1 минуту, проталкиваем с увеличенным газом...")
+                gas_price_gwei = random.uniform(0.3, 0.4)  # Новая цена газа: 0.3–0.4 Gwei
+                logging.info(f"Новая цена газа для проталкивания: {gas_price_gwei} Gwei")
+                # Повторно отправляем ту же транзакцию с увеличенной ценой газа
+                txn_hash = send_transaction(sender_wallet, receiver_wallet, private_key, amount_to_send_wei, gas_price_gwei, nonce)
+                if txn_hash:
+                    last_tx_hashes[sender_wallet] = txn_hash  # Обновляем хэш для проверки
+
+                # Повторяем цикл проверки после проталкивания (ещё 1 минута)
+                max_attempts = 6  # 1 минута / 10 секунд = 6 попыток
+                for attempt in range(max_attempts):
+                    time.sleep(25)  # Ждём 10 секунд перед проверкой
+                    if txn_hash:
+                        receipt = check_transaction_status(txn_hash)
+                        if receipt is not None:
+                            break  # Если транзакция подтвердилась, выходим из цикла
+                    else:
+                        # Если хэш неизвестен, проверяем nonce
+                        current_nonce = w3.eth.getTransactionCount(sender_wallet, 'latest')
+                        if current_nonce > nonce:
+                            logging.info(f"Транзакция с nonce {nonce} подтвердилась (текущий nonce: {current_nonce})")
+                            receipt = True  # Флаг, что транзакция подтвердилась
+                            break
+                    logging.info(f"Проверка статуса транзакции с nonce {nonce} после проталкивания, попытка {attempt + 1}/{max_attempts}, RPC сменён, ждём 10 секунд...")
+                    switch_rpc()  # Переключаем RPC при каждой проверке
+
+                # Если транзакция подтвердилась после проталкивания, обрабатываем её
+                if receipt is not None:
+                    if txn_hash and receipt is not True:  # Если у нас есть хэш и это не флаг
+                        if receipt['status'] == 0:
+                            logging.warning(f"Транзакция {txn_hash} провалилась (status=0) даже после проталкивания, завершаем обработку кошелька...")
+                            last_tx_hashes[sender_wallet] = None
+                            break  # Завершаем обработку кошелька
+                        elif receipt['status'] == 1:
+                            logging.info(f"Транзакция {txn_hash} подтверждена (status=1) после проталкивания")
+                            expected_amount = amount_to_send_wei
+                            logging.info(f"Ожидаем поступление {w3.fromWei(expected_amount, 'ether')} ETH на {receiver_wallet}")
+                        else:
+                            logging.error(f"Неизвестный статус транзакции {txn_hash}: {receipt['status']}")
+                            switch_rpc()
+                            time.sleep(10)
+                            continue
+                    else:
+                        # Транзакция подтвердилась (по nonce), но хэш неизвестен
+                        logging.info(f"Транзакция с nonce {nonce} подтверждена (по nonce) после проталкивания, ожидаем поступления ETH...")
+
+                    # Проверяем баланс получателя с паузой 10 секунд
+                    while True:
+                        time.sleep(25)  # Ждём 10 секунд перед проверкой
+                        current_receiver_balance = get_balance_with_retries(receiver_wallet)
+                        if current_receiver_balance is None:
+                            logging.info(f"Не удалось получить баланс {receiver_wallet}, RPC сменён, ждём 10 секунд...")
+                            continue
+                        if current_receiver_balance > initial_receiver_balance:
+                            received_amount = current_receiver_balance - initial_receiver_balance
+                            logging.info(
+                                f"ETH поступил на {receiver_wallet}: получено {w3.fromWei(received_amount, 'ether')} ETH, "
+                                f"новый баланс: {w3.fromWei(current_receiver_balance, 'ether')} ETH"
+                            )
+                            break  # ETH поступил, выходим из цикла ожидания
+                        logging.info(f"ETH пока не поступил на {receiver_wallet}, меняем RPC и ждём 10 секунд...")
+                        switch_rpc()  # Меняем RPC, если баланс не увеличился
+                    last_tx_hashes[sender_wallet] = None  # Очищаем хэш после успешной транзакции
+                    break  # Транзакция успешна, выходим из цикла отправки
+
+                # Если транзакция не подтвердилась даже после проталкивания, завершаем обработку кошелька
+                logging.error(f"Транзакция с nonce {nonce} не подтвердилась даже после проталкивания, завершаем обработку кошелька...")
+                last_tx_hashes[sender_wallet] = None
+                break
+
+            # Пауза 40-60 минут после успешной транзакции
+            delay = random.randint(100, 120)
+            logging.info(f"Ожидание {delay // 6} минут перед следующей транзакцией...")
+            time.sleep(delay)
+
+        except Exception as e:
+            logging.error(f"Ошибка при обработке кошелька {sender_wallet}: {e}")
+            continue
+
+    logging.info("Пересылка ETH по кругу завершена.")
+    # Случайная пауза 6-8 часов перед следующим кругом
+    delay = random.randint(21600, 28800)  # 6-8 часов в секундах
+    logging.info(f"Пауза {delay // 3600} часов перед следующим кругом...")
+    time.sleep(delay)
