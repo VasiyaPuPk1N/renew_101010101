@@ -1,0 +1,178 @@
+import csv
+import logging
+import os
+import time
+import requests
+
+# Настройка логирования (вывод на экран и сохранение в файл логов)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("dbk_scan_history.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+# --- КОНФИГУРАЦИЯ ФАЙЛОВ ---
+INPUT_FILE = "wallet.txt"  # Текстовый файл, откуда берем кошельки
+OUTPUT_CSV = "dbk_balances.csv"  # Итоговая таблица с результатами сканирования
+
+
+def load_wallets(file_path):
+    """Надежное построчное чтение адресов кошельков из TXT файла."""
+    if not os.path.exists(file_path):
+        logging.error(f"Критическая ошибка: Входной файл {file_path} не найден!")
+        logging.info("Пожалуйста, создайте файл wallet.txt в папке со скриптом и вставьте туда адреса.")
+        return []
+
+    wallets = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            addr = line.strip().lower()
+            # Проверяем, что это валидный Ethereum-подобный адрес кошелька
+            if addr.startswith("0x") and len(addr) == 42:
+                wallets.append(addr)
+
+    logging.info(f"Успешно загружено {len(wallets)} валидных адресов из файла {file_path}.")
+    return wallets
+
+
+# --- ПРОДОЛЖЕНИЕ СКРИПТА (ЧАСТЬ 2) ---
+
+# Официальный RPC-сервер сети DBK Chain с вашего скриншота
+DBK_RPC_URL = "https://dbkchain.io"
+
+# Заголовки, чтобы нода видела в скрипте обычный сетевой запрос
+HTTP_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
+
+
+def get_dbk_eth_balance(wallet_address):
+    """
+    Получает баланс ETH напрямую из блокчейна DBK Chain через JSON-RPC запрос.
+    Метод полностью бесплатен, стабилен и не требует никаких API-ключей.
+    """
+    # Стандартная структура JSON-RPC для чтения баланса
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getBalance",
+        "params": [wallet_address, "latest"],
+        "id": 1
+    }
+
+    try:
+        # Отправляем прямой HTTP POST запрос к ноде DBK
+        response = requests.post(DBK_RPC_URL, json=payload, headers=HTTP_HEADERS, timeout=10)
+
+        if response.status_code == 200:
+            json_data = response.json()
+
+            # Проверяем, нет ли внутренней ошибки блокчейна в ответе
+            if "error" in json_data:
+                logging.error(f"Ошибка RPC для {wallet_address}: {json_data['error'].get('message')}")
+                return None
+
+            # Баланс возвращается в шестнадцатеричном формате Wei (Hex)
+            hex_balance = json_data.get("result")
+            if hex_balance:
+                # Переводим Hex Wei в обычное число Wei, а затем делим на 10^18 для получения ETH
+                wei_balance = int(hex_balance, 16)
+                eth_balance = wei_balance / 10 ** 18
+                return eth_balance
+        else:
+            logging.error(f"Нода DBK вернула код ответа {response.status_code} для {wallet_address}")
+            return None
+
+    except Exception as e:
+        logging.error(f"Сетевой сбой при опросе ноды DBK для {wallet_address}: {e}")
+        return None
+
+
+# --- ПРОДОЛЖЕНИЕ СКРИПТА (ЧАСТЬ 3) ---
+
+def scan_dbk_chain_balances():
+    """Основная функция сканирования кошельков в сети DBK Chain."""
+    # Загружаем кошельки из файла wallet.txt
+    wallets = load_wallets(INPUT_FILE)
+    if not wallets:
+        return
+
+    logging.info("Начинаем сканирование балансов ETH в сети DBK Chain...")
+    results = []
+    total_sum_eth = 0.0  # Переменная для подсчета итоговой суммы
+
+    for i, address in enumerate(wallets):
+        logging.info(f"[{i + 1}/{len(wallets)}] Сканируем кошелек: {address}")
+
+        # Получаем баланс через JSON-RPC запрос к ноде DBK
+        eth_balance = get_dbk_eth_balance(address)
+
+        if eth_balance is not None:
+            logging.info(f"   Баланс: {eth_balance:.8f} ETH")
+            total_sum_eth += eth_balance
+        else:
+            logging.warning(f"   Не удалось получить баланс для {address} (записано как 0.0)")
+            eth_balance = 0.0
+
+        # Добавляем данные в промежуточный список результатов
+        results.append({
+            "wallet_address": address,
+            "balance_eth": eth_balance
+        })
+
+        # СТРОГАЯ ПАУЗА В 5 СЕКУНД МЕЖДУ ЗАПРОСАМИ
+        if i < len(wallets) - 1:
+            time.sleep(5)
+
+    # Выводим итоговую сумму в консоль
+    logging.info("=" * 70)
+    logging.info(f"СКАНИРОВАНИЕ ЗАВЕРШЕНО! Итоговая сумма на всех кошельках: {total_sum_eth:.8f} ETH")
+    logging.info("=" * 70)
+
+    # Передаем данные дальше для записи в красивую таблицу
+    save_results_to_csv(results, total_sum_eth)
+
+
+# --- ПРОДОЛЖЕНИЕ СКРИПТА (ЧАСТЬ 4) ---
+
+def save_results_to_csv(results, total_sum):
+    """Автоматически записывает результаты и итоговую сумму в файл таблицы CSV."""
+    try:
+        with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as f:
+            fieldnames = ["wallet_address", "balance_eth"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+            # Записываем шапку таблицы
+            writer.writeheader()
+
+            # Записываем данные по каждому кошельку по очереди
+            for row in results:
+                writer.writerow(row)
+
+            # Добавляем пустую строку для визуального разделения (по желанию)
+            writer.writerow({"wallet_address": "", "balance_eth": ""})
+
+            # ЗАПИСЫВАЕМ СТРОКУ С ИТОГОВОЙ СУММОЙ
+            writer.writerow({
+                "wallet_address": "ИТОГОВАЯ СУММА (TOTAL):",
+                "balance_eth": f"{total_sum:.8f}"
+            })
+
+        logging.info(f"✓ Все данные и итоговая сумма успешно сохранены в таблицу: {OUTPUT_CSV}")
+
+    except Exception as e:
+        logging.error(f"Не удалось сохранить результаты в файл таблицы CSV: {e}")
+
+
+# --- ЗАВЕРШЕНИЕ СКРИПТА (ЧАСТЬ 5) ---
+
+if __name__ == "__main__":
+    logging.info("================================================================")
+    logging.info("Скрипт проверки балансов DBK Chain успешно запущен.")
+    logging.info("================================================================")
+
+    # Запускаем главную функцию сканирования
+    scan_dbk_chain_balances()
