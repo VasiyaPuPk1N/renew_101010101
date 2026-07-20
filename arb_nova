@@ -20,27 +20,28 @@ logging.basicConfig(
 )
 
 # --- КОНФИГУРАЦИЯ ФАЙЛОВ И ЛИМИТОВ ---
-ENCRYPTED_JSON_FILE = "encrypted_126.json" 
-MIN_BALANCE_THRESHOLD = 0.0001  
+ENCRYPTED_JSON_FILE = "encrypted_126.json"
+MIN_BALANCE_THRESHOLD = 0.0001
 
-# ОБНОВЛЕНО: Самые быстрые RPC-ноды Arbitrum Nova (без WSS)
+# Проверенные RPC-ноды Arbitrum Nova (основной родной RPC на первом месте)
 rpc_providers = [
-    "https://arb-nova-mainnet.gateway.tatum.io",
-    "https://docs-demo.nova-mainnet.quiknode.pro",
-    "https://arbitrum-nova.drpc.org",
-    "https://arbitrum-nova-rpc.publicnode.com"
+    "https://nova.arbitrum.io/rpc",
+    "https://arbitrum-nova-rpc.publicnode.com",
+    "https://rpc.ankr.com/arbitrum_nova"
 ]
 
 current_rpc_index = 0
 w3 = None
 
+
 def init_web3(rpc_url):
     """Инициализация подключения к узлу Arbitrum Nova."""
     global w3
-    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 15}))
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 25}))
+
 
 def is_w3_connected():
-    """Совместимая проверка соединения для старых версий Web3.py."""
+    """Совместимая проверка соединения для любых версий Web3.py."""
     if w3 is None:
         return False
     try:
@@ -53,6 +54,7 @@ def is_w3_connected():
     except Exception:
         return False
 
+
 def switch_rpc():
     """Автоматическое переключение на резервную ноду при сбоях."""
     global current_rpc_index
@@ -61,6 +63,7 @@ def switch_rpc():
     logging.info(f"Переключаемся на резервный RPC Nova: {new_rpc}")
     init_web3(new_rpc)
     return is_w3_connected()
+
 
 # Первичное подключение к сети Arbitrum Nova
 for rpc in rpc_providers:
@@ -77,16 +80,17 @@ if not is_w3_connected():
     logging.error("Критическая ошибка: Не удалось подключиться ни к одной ноде Arbitrum Nova!")
     exit(1)
 
+
 def load_secure_keys_126():
     """Извлечение и дешифровка 126 ключей с помощью системной переменной '126'."""
     key_env = os.getenv('126')
     if key_env is None:
         logging.error("Критическая ошибка: В переменных среды не найден ключ шифрования '126'!")
         return []
-        
+
     key_bytes = key_env.strip("b'").encode()
     cipher_suite = Fernet(key_bytes)
-    
+
     try:
         with open(ENCRYPTED_JSON_FILE, 'rb') as file:
             encrypted_data = file.read()
@@ -100,26 +104,27 @@ def load_secure_keys_126():
     processed_accounts = []
     for pk in private_keys_raw[:126]:
         key_cleaned = pk[2:] if pk.startswith('0x') else pk
-        if len(key_cleaned) != 64: 
+        if len(key_cleaned) != 64:
             continue
         try:
             account = Account.from_key(key_cleaned)
             processed_accounts.append((account.address.lower(), key_cleaned))
         except Exception:
             continue
-            
+
     logging.info(f"Авторизация успешна. Извлечено и проверено {len(processed_accounts)} кошельков.")
     return processed_accounts
 
+
 def get_wallet_balance_eth(wallet_address):
-    """Получает баланс кошелька в ETH с поддержкой старого синтаксиса getBalance."""
+    """Получает баланс кошелька в ETH."""
     try:
         checksum_addr = to_checksum_address(wallet_address)
         if hasattr(w3.eth, 'get_balance'):
             balance_wei = w3.eth.get_balance(checksum_addr)
         else:
             balance_wei = w3.eth.getBalance(checksum_addr)
-        return balance_wei / 10**18
+        return balance_wei / 10 ** 18
     except Exception as e:
         logging.warning(f"Ошибка получения баланса для {wallet_address}: {e}. Пробуем резервный RPC...")
         switch_rpc()
@@ -129,60 +134,70 @@ def get_wallet_balance_eth(wallet_address):
                 balance_wei = w3.eth.get_balance(checksum_addr)
             else:
                 balance_wei = w3.eth.getBalance(checksum_addr)
-            return balance_wei / 10**18
+            return balance_wei / 10 ** 18
         except Exception:
             return None
 
-def calculate_tx_fees():
-    """Рассчитывает лимиты газа EIP-1559 с поддержкой старого синтаксиса."""
+
+def calculate_tx_fees(sender_checksum, recipient_checksum):
+    """Динамический расчет газа и комиссии EIP-1559 под Arbitrum Nova."""
     try:
         if hasattr(w3.eth, 'get_block'):
             latest_block = w3.eth.get_block('latest')
         else:
             latest_block = w3.eth.getBlock('latest')
-            
+
         base_fee = latest_block['baseFeePerGas']
-        
+
         if hasattr(w3.eth, 'max_priority_fee'):
             max_priority_fee = w3.eth.max_priority_fee
         else:
             max_priority_fee = w3.eth.maxPriorityFeePerGas
-        
+
         max_fee = int(base_fee * 1.4) + max_priority_fee
-        gas_limit = 21000
+
+        try:
+            if hasattr(w3.eth, 'estimate_gas'):
+                estimated_gas = w3.eth.estimate_gas({'from': sender_checksum, 'to': recipient_checksum})
+            else:
+                estimated_gas = w3.eth.estimateGas({'from': sender_checksum, 'to': recipient_checksum})
+            gas_limit = int(estimated_gas * 1.2)
+        except Exception:
+            gas_limit = 50000
+
         max_tx_cost_wei = max_fee * gas_limit
-        
         return gas_limit, max_fee, max_priority_fee, max_tx_cost_wei
     except Exception as e:
         logging.error(f"Не удалось рассчитать параметры газа: {e}")
         switch_rpc()
         return None
 
+
 def send_nova_tx(sender_address, private_key, recipient_address, balance_eth):
     """Формирует, подписывает и отправляет транзакцию перевода ETH."""
     try:
         sender_checksum = to_checksum_address(sender_address)
         recipient_checksum = to_checksum_address(recipient_address)
-        
-        fee_info = calculate_tx_fees()
+
+        fee_info = calculate_tx_fees(sender_checksum, recipient_checksum)
         if not fee_info:
             logging.error(f"   Пропускаем кошелек {sender_address} из-за ошибки расчета газа.")
             return False
-            
+
         gas_limit, max_fee, max_priority_fee, max_tx_cost_wei = fee_info
-        balance_wei = int(balance_eth * 10**18)
-        
+        balance_wei = int(balance_eth * 10 ** 18)
+
         amount_to_send_wei = balance_wei - max_tx_cost_wei
-        
+
         if amount_to_send_wei <= 0:
             logging.warning(f"   Баланса {balance_eth:.6f} ETH на {sender_address} не хватит на оплату газа.")
             return False
-            
+
         if hasattr(w3.eth, 'get_transaction_count'):
             nonce = w3.eth.get_transaction_count(sender_checksum)
         else:
             nonce = w3.eth.getTransactionCount(sender_checksum)
-        
+
         tx = {
             'from': sender_checksum,
             'to': recipient_checksum,
@@ -191,34 +206,41 @@ def send_nova_tx(sender_address, private_key, recipient_address, balance_eth):
             'maxFeePerGas': max_fee,
             'maxPriorityFeePerGas': max_priority_fee,
             'nonce': nonce,
-            'chainId': 42170  # Arbitrum Nova
+            'chainId': 42170
         }
-        
+
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
-        
+
         if hasattr(w3.eth, 'send_raw_transaction'):
             tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
         else:
             tx_hash = w3.eth.sendRawTransaction(signed_tx.rawTransaction)
-            
-        logging.info(f"   ➔ Транзакция отправлена! Сумма: {amount_to_send_wei / 10**18:.6f} ETH. Хэш: {w3.to_hex(tx_hash)}")
-        
+
+        # ИСПРАВЛЕНО: Совместимый с v5.x перевод в Hex строку
+        try:
+            tx_hash_str = Web3.toHex(tx_hash)
+        except Exception:
+            tx_hash_str = tx_hash.hex() if hasattr(tx_hash, 'hex') else str(tx_hash)
+
+        logging.info(f"   ➔ Транзакция отправлена! Сумма: {amount_to_send_wei / 10 ** 18:.6f} ETH. Хэш: {tx_hash_str}")
+
         if hasattr(w3.eth, 'wait_for_transaction_receipt'):
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
         else:
             receipt = w3.eth.waitForTransactionReceipt(tx_hash, timeout=60)
-        
+
         if receipt['status'] == 1:
             logging.info(f"   ✓ УСПЕШНО: Средства успешно доставлены на {recipient_address}!")
             return True
         else:
             logging.error(f"   ✗ СБОЙ: Блокчейн Nova отклонил выполнение транзакции.")
             return False
-            
+
     except Exception as e:
         logging.error(f"   ✗ Критическая ошибка при отправке транзакции: {e}")
         switch_rpc()
         return False
+
 
 def main():
     accounts = load_secure_keys_126()
@@ -231,12 +253,12 @@ def main():
     logging.info(f"Направление сбора: от кошелька {total_wallets} к кошельку 1.")
     logging.info("=" * 80)
 
-    # Движение сзади наперед: от последнего к первому
     for i in range(total_wallets - 1, 0, -1):
         sender_address, sender_key = accounts[i]
         recipient_address, _ = accounts[i - 1]
 
-        logging.info(f"[{total_wallets - i}/{total_wallets - 1}] Проверяем кошелек-отправитель #{i + 1}: {sender_address}")
+        logging.info(
+            f"[{total_wallets - i}/{total_wallets - 1}] Проверяем кошелек-отправитель #{i + 1}: {sender_address}")
         logging.info(f"   Целевой кошелек-получатель #{i}: {recipient_address}")
 
         balance = get_wallet_balance_eth(sender_address)
@@ -251,13 +273,11 @@ def main():
             logging.info(f"   🚀 Баланс выше лимита ({MIN_BALANCE_THRESHOLD} ETH). Начинаем сбор...")
             tx_sent = send_nova_tx(sender_address, sender_key, recipient_address, balance)
             if not tx_sent:
-                logging.warning(f"   ⚠️ Транзакция не прошла. Цепочка прервана на шаге {i + 1} -> {i}. Переходим к следующему.")
+                logging.warning(
+                    f"   ⚠️ Транзакция не прошла. Цепочка прервана на шаге {i + 1} -> {i}. Переходим к следующему.")
         else:
             logging.info(f"   Пропускаем сбор: баланс меньше или равен лимиту {MIN_BALANCE_THRESHOLD} ETH.")
 
-        # УМНЫЕ ПАУЗЫ:
-        # Если была транзакция — ждем 8-18 сек для маскировки.
-        # Если кошелек пустой — делаем паузу 1-3 сек, чтобы быстро двигаться дальше.
         if i > 1:
             if tx_sent:
                 sleep_time = random.randint(8, 18)
@@ -268,11 +288,12 @@ def main():
 
     logging.info("=" * 80)
     logging.info("Процедура агрегации ETH по цепочке кошельков полностью завершена!")
-    
+
     final_main_addr = accounts[0][0]
     final_balance = get_wallet_balance_eth(final_main_addr)
     if final_balance is not None:
         logging.info(f"💰 Итоговый баланс на основном кошельке #1 ({final_main_addr}): {final_balance:.6f} ETH")
+
 
 if __name__ == "__main__":
     logging.info("================================================================")
