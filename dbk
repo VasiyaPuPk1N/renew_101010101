@@ -41,7 +41,7 @@ def load_wallets(file_path):
 # --- ПРОДОЛЖЕНИЕ СКРИПТА (ЧАСТЬ 2) ---
 
 # Официальный RPC-сервер сети DBK Chain с вашего скриншота
-DBK_RPC_URL = "https://dbkchain.io"
+DBK_RPC_URL = "https://rpc.mainnet.dbkchain.io"
 
 # Заголовки, чтобы нода видела в скрипте обычный сетевой запрос
 HTTP_HEADERS = {
