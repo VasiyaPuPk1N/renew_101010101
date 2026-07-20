@@ -21,13 +21,14 @@ logging.basicConfig(
 
 # --- КОНФИГУРАЦИЯ ФАЙЛОВ И ЛИМИТОВ ---
 ENCRYPTED_JSON_FILE = "encrypted_126.json" 
-# Лимит изменён под твой запрос (более 0.0001 ETH)
 MIN_BALANCE_THRESHOLD = 0.0001  
 
-# ИСПРАВЛЕНО: Рабочие RPC-ноды Arbitrum Nova
+# ОБНОВЛЕНО: Самые быстрые RPC-ноды Arbitrum Nova (без WSS)
 rpc_providers = [
-    "https://arbitrum-nova-rpc.publicnode.com",
-    "https://nova.arbitrum.io/rpc"
+    "https://arb-nova-mainnet.gateway.tatum.io",
+    "https://docs-demo.nova-mainnet.quiknode.pro",
+    "https://arbitrum-nova.drpc.org",
+    "https://arbitrum-nova-rpc.publicnode.com"
 ]
 
 current_rpc_index = 0
@@ -245,18 +246,24 @@ def main():
 
         logging.info(f"   Текущий баланс: {balance:.6f} ETH")
 
+        tx_sent = False
         if balance > MIN_BALANCE_THRESHOLD:
             logging.info(f"   🚀 Баланс выше лимита ({MIN_BALANCE_THRESHOLD} ETH). Начинаем сбор...")
-            success = send_nova_tx(sender_address, sender_key, recipient_address, balance)
-            if not success:
+            tx_sent = send_nova_tx(sender_address, sender_key, recipient_address, balance)
+            if not tx_sent:
                 logging.warning(f"   ⚠️ Транзакция не прошла. Цепочка прервана на шаге {i + 1} -> {i}. Переходим к следующему.")
         else:
             logging.info(f"   Пропускаем сбор: баланс меньше или равен лимиту {MIN_BALANCE_THRESHOLD} ETH.")
 
-        # Небольшая пауза для маскировки (для Nova 5-15 секунд вполне безопасно)
+        # УМНЫЕ ПАУЗЫ:
+        # Если была транзакция — ждем 8-18 сек для маскировки.
+        # Если кошелек пустой — делаем паузу 1-3 сек, чтобы быстро двигаться дальше.
         if i > 1:
-            sleep_time = random.randint(5, 15)
-            logging.info(f"   Маскировка: Ожидаем {sleep_time} сек. перед проверкой следующего кошелька...")
+            if tx_sent:
+                sleep_time = random.randint(8, 18)
+                logging.info(f"   Маскировка: Ожидаем {sleep_time} сек. после транзакции...")
+            else:
+                sleep_time = random.randint(1, 3)
             time.sleep(sleep_time)
 
     logging.info("=" * 80)
